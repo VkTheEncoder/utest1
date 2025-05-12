@@ -9,9 +9,12 @@ logging.basicConfig(level=logging.INFO)
 client = TelegramClient('hianime_session', API_ID, API_HASH)
 
 async def main():
+    # Start the session (user or bot)
     await client.start()
+    # Wire up all your handlers
     await register_handlers(client)
     print("🚀 Bot is up!")
+    # Keep running until interrupted
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
