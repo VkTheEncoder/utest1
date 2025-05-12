@@ -8,7 +8,7 @@ client = TelegramClient('hianime_session', API_ID, API_HASH)
 async def main():
     await client.start()
     await register_handlers(client)
-    print("🚀 Bot is up and running")
+    print("🚀 Bot is up")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
