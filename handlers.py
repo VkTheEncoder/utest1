@@ -1,77 +1,54 @@
 # handlers.py
-import os
-import time
-import asyncio
-import logging
-from urllib.parse import urlparse, parse_qs
-
+import os, asyncio, logging
 from telethon import events, Button
-
 from fetcher import (
     search_anime,
     fetch_episodes,
     fetch_sources_and_referer,
-    fetch_tracks
+    fetch_tracks,
 )
-from downloader import remux_with_progress, download_subtitle
+from downloader import remux_hls, download_subtitle
 
-# Per-chat state
-STATE: dict[int, dict] = {}
-
-# Command & URL patterns
-CMD_SRCH = r'^/search (.+)'
-URL_EP   = r'https?://hianimez?\.to/watch/[^?\s]+[?&]ep=\d+'
-
-
-def build_progress_card(title, transferred, total, start, now):
-    elapsed = now - start
-    pct     = transferred / total * 100 if total else 0
-    speed   = transferred / elapsed     if elapsed>0 else 0
-    eta     = (total - transferred) / speed if speed>0 else 0
-
-    return (
-        f"<b>{title}</b>\n\n"
-        f"Size: {transferred/1e6:.2f} MB of {total/1e6:.2f} MB\n"
-        f"⚡ Speed: {speed/1e6:.2f} MB/s\n"
-        f"⏱ Elapsed: {int(elapsed)}s\n"
-        f"⏳ ETA: {int(eta)}s\n"
-        f"📊 Progress: {pct:.1f}%"
-    )
-
+STATE: dict = {}  # per-chat queue & cache
 
 async def register_handlers(client):
-    # ── /search ────────────────────────────────────────────────────────────────
-    @client.on(events.NewMessage(pattern=CMD_SRCH))
+    # ── SEARCH COMMAND ─────────────────────────────────────────────────────────
+    @client.on(events.NewMessage(pattern=r"^/search (.+)"))
     async def on_search(event):
         query = event.pattern_match.group(1)
-        msg   = await event.reply("🔍 Searching…")
-        results = search_anime(query)
-        if not results:
-            return await msg.edit("❌ No matches.")
-        buttons = [[Button.inline(a["name"], f"ANIME|{a['id']}")] for a in results]
-        await msg.edit("🔎 Select an anime:", buttons=buttons)
+        msg = await event.reply("🔍 Searching…")
+        animes = search_anime(query)
+        if not animes:
+            return await msg.edit("❌ No results.")
+        buttons = [
+            [Button.inline(a["name"], f"ANIME|{a['id']}")]
+            for a in animes
+        ]
+        await msg.edit("🔎 Select anime:", buttons=buttons)
 
-    # ── ANIME ► EPISODES ──────────────────────────────────────────────────────────
+    # ── ANIME SELECTED ─────────────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ANIME|")))
     async def on_select_anime(event):
-        anime_id = event.data.decode().split("|",1)[1]
+        anime_id = event.data.decode().split("|", 1)[1]
         msg = await event.edit("📺 Fetching episodes…")
         eps = fetch_episodes(anime_id)
         if not eps:
             return await msg.edit("ℹ️ No episodes found.")
+        # build buttons: one-per-episode + an ALL button
         rows = [[Button.inline("▶ Download ALL", f"ALL|{anime_id}")]]
         for ep in eps:
-            rows.append([Button.inline(f"Ep {ep['number']}", f"EP|{ep['episodeId']}")])
-        await msg.edit("📃 Choose an episode or ALL:", buttons=rows)
+            label = f"Ep {ep['number']}: {ep.get('title','')}"
+            rows.append([Button.inline(label, f"EP|{ep['episodeId']}")])
+        await msg.edit("📃 Choose one or ALL:", buttons=rows)
 
-    # ── EPISODE ► SINGLE DOWNLOAD ───────────────────────────────────────────────
+    # ── SINGLE EPISODE ──────────────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"EP|")))
     async def on_single_episode(event):
         episode_id = event.data.decode().split("|",1)[1]
-        await event.answer()
-        await _download_with_progress(event.chat_id, episode_id, client, event)
+        await event.answer()  # remove “loading”
+        await _download_episode(event.chat_id, episode_id, event)
 
-    # ── EPISODE ► QUEUE ALL ─────────────────────────────────────────────────────
+    # ── QUEUE “ALL” EPISODES ───────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ALL|")))
     async def on_all(event):
         anime_id = event.data.decode().split("|",1)[1]
@@ -80,63 +57,62 @@ async def register_handlers(client):
         queue = [ep["episodeId"] for ep in eps]
         STATE[event.chat_id] = {"queue": queue}
         await event.edit(f"📥 Queued {len(queue)} episodes. Starting…")
-        asyncio.create_task(_process_queue(event.chat_id, client))
+        # process queue in background
+        asyncio.create_task(_process_queue(event.chat_id))
 
-
-async def _download_with_progress(chat_id, episode_id, client, ctx_event=None):
-    # 1) fetch sources
-    sources, referer = fetch_sources_and_referer(episode_id)
-    hls_list = [s for s in sources if s.get("type")=="hls"]
-    best = max(hls_list, key=lambda s: int(s.get("quality","0p")[:-1]))
-    m3u8 = best["url"]
-
-    # 2) subtitle
-    tracks = fetch_tracks(episode_id)
-    eng = next((t for t in tracks if "english" in t.get("label","").lower()), None)
-
-    # 3) status message
+# ── CORE DOWNLOAD LOGIC ─────────────────────────────────────────────────────────
+async def _download_episode(chat_id: int, episode_id: str, ctx_event=None):
+    """
+    Fetch best-quality HLS + English subtitle, remux & send.
+    If ctx_event is provided, uses it to edit status; else uses send_message.
+    """
+    # pick status updaters
     if ctx_event:
-        status = await ctx_event.edit("⏳ Preparing download…", parse_mode="html")
+        edit = ctx_event.edit
     else:
-        status = await client.send_message(chat_id, "⏳ Preparing download…", parse_mode="html")
+        edit = lambda text, **k: client.send_message(chat_id, text, **k)
 
-    # 4) download/remux
+    status = await edit(f"⏳ Downloading {episode_id}…", parse_mode="html")
+
+    # 1) HLS sources
+    sources, referer = fetch_sources_and_referer(episode_id)
+    hls = [s for s in sources if s.get("type")=="hls"]
+    # pick highest quality
+    def qval(s):
+        q = s.get("quality","0p").rstrip("p")
+        return int(q) if q.isdigit() else 0
+    best = max(hls, key=qval)
+    # 2) remux
     out_mp4 = f"downloads/{episode_id}.mp4"
-    t0 = time.time()
-    def dl_cb(transferred, total, start):
-        card = build_progress_card("📥 Downloading File", transferred, total, start, time.time())
-        asyncio.create_task(status.edit(card, parse_mode="html"))
+    remux_hls(best["url"], referer, out_mp4)
+    await status.edit("💾 Video ready, fetching subtitle…")
 
-    remux_with_progress(m3u8, referer, out_mp4, dl_cb)
-
-    # 5) subtitle file
+    # 3) English subtitle
+    tracks = fetch_tracks(episode_id)
+    eng = next((t for t in tracks if t.get("label","").lower().startswith("english")), None)
     if eng:
-        await status.edit("💾 Downloading subtitle…", parse_mode="html")
         sub_path = download_subtitle(eng, "downloads", episode_id)
     else:
         sub_path = None
 
-    # 6) upload
-    await status.edit("🚀 Uploading video…", parse_mode="html")
-    up0 = time.time()
-    async def up_cb(sent, total):
-        card = build_progress_card("📤 Uploading File", sent, total, up0, time.time())
-        asyncio.create_task(status.edit(card, parse_mode="html"))
-
-    await client.send_file(chat_id, out_mp4, progress_callback=up_cb)
+    # 4) send files
+    await client.send_file(chat_id, out_mp4, caption=f"<b>{episode_id}</b>", parse_mode="html")
     if sub_path:
         await client.send_file(chat_id, sub_path)
+    await status.edit("✅ Done!")
 
-    await status.edit("<b>✅ Completed!</b>", parse_mode="html")
-
-
-async def _process_queue(chat_id, client):
-    queue = STATE.get(chat_id, {}).get("queue", [])
+async def _process_queue(chat_id: int):
+    """
+    Pops from STATE[chat_id]['queue'] until empty,
+    sequencing downloads one after the other.
+    """
+    state = STATE.get(chat_id, {})
+    queue = state.get("queue", [])
     while queue:
-        eid = queue.pop(0)
+        episode_id = queue.pop(0)
         try:
-            await _download_with_progress(chat_id, eid, client)
+            await _download_episode(chat_id, episode_id)
         except Exception as e:
-            logging.exception("Queue error")
-            await client.send_message(chat_id, f"❌ Failed on {eid}: {e}")
+            logging.exception("Queue download failed")
+            await client.send_message(chat_id, f"❌ Failed on {episode_id}: {e}")
     await client.send_message(chat_id, "🏁 All done!")
