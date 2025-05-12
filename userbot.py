@@ -1,158 +1,163 @@
 #!/usr/bin/env python3
-import os, logging, subprocess, time
+import os
+import logging
+import subprocess
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 import requests
 
-#─── Config ────────────────────────────────────────────────────────────────────
+#─── CONFIG ─────────────────────────────────────────────────────────────────────
 load_dotenv()
-API_ID   = int(os.getenv("API_ID", 0))
+API_ID   = int(os.getenv("API_ID",   0))
 API_HASH = os.getenv("API_HASH", "")
 API_BASE = os.getenv("ANIWATCH_API_BASE", "http://localhost:4000/api/v2/hianime")
+
 if not API_ID or not API_HASH:
-    raise RuntimeError("API_ID/API_HASH not set")
+    raise RuntimeError("API_ID/API_HASH not set in .env")
 
 logging.basicConfig(level=logging.INFO)
-client = TelegramClient('session', API_ID, API_HASH)
+client = TelegramClient('hianime_user_session', API_ID, API_HASH)
 
-#─── In-memory state ─────────────────────────────────────────────────────────────
+#─── GLOBAL STATE CACHE ─────────────────────────────────────────────────────────
 # key = f"{chat_id}:{slug}:{ep}"
 STATE = {}
 
-#─── Helpers ────────────────────────────────────────────────────────────────────
+#─── HELPERS ────────────────────────────────────────────────────────────────────
 def fetch_sources(slug, ep):
-    data = requests.get(
+    resp = requests.get(
         f"{API_BASE}/episode/sources",
-        params={"animeEpisodeId":f"{slug}?ep={ep}","server":"hd-1","category":"sub"}
-    ).json()["data"]
-    return data["sources"], data["headers"].get("Referer")
+        params={"animeEpisodeId": f"{slug}?ep={ep}", "server": "hd-1", "category": "sub"}
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+    return data.get("sources", []), data.get("headers", {}).get("Referer")
 
 def ascii_progress(current, total, length=20):
-    pct = int(current/total * 100) if total else 0
-    filled = int(pct/100 * length)
-    bar = "█"*filled + "─"*(length-filled)
+    pct = int(current / total * 100) if total else 0
+    filled = int(pct / 100 * length)
+    bar = "█" * filled + "─" * (length - filled)
     return f"[{bar}] {pct:3d}%"
 
-#─── 1) CATCH EPISODE URL & SHOW QUALITY BUTTONS ─────────────────────────────────
-@client.on(events.NewMessage(pattern=r'https?://hianimez?\.to/watch/[^?\s]+[?&]ep=\d+'))
+def remux_hls(m3u8_url: str, referer: str|None, out_path: str):
+    cmd = ["ffmpeg", "-y"]
+    if referer:
+        cmd += ["-headers", f"Referer: {referer}\r\n"]
+    cmd += ["-i", m3u8_url, "-c", "copy", out_path]
+    subprocess.run(cmd, check=True)
+
+#─── TELETHON CLIENT SETUP ───────────────────────────────────────────────────────
+# Matches episode URLs
+URL_REGEX = r'https?://hianimez?\.to/watch/[^?\s]+[?&]ep=\d+'
+
+@client.on(events.NewMessage(pattern=URL_REGEX))
 async def on_episode_link(event):
     url = event.raw_text.strip()
-    p = urlparse(url); slug = p.path.split("/")[-1]
-    ep = parse_qs(p.query)["ep"][0]
-
-    # fetch your HLS streams
+    p = urlparse(url)
+    slug = p.path.strip("/").split("/")[-1]
+    ep = parse_qs(p.query).get("ep", [None])[0]
+    if not ep:
+        return await event.reply("❌ No episode number found in URL.")
     sources, referer = fetch_sources(slug, ep)
-    hls = [s for s in sources if s["type"]=="hls"]
+    hls = [s for s in sources if s.get("type") == "hls" or s.get("url", "").endswith(".m3u8")]
     if not hls:
-        return await event.reply("❌ No HLS source found.")
-
-    # save to STATE
-    STATE[f"{event.chat_id}:{slug}:{ep}"] = {"hls":hls, "referer":referer}
-
-    # send an HTML-formatted prompt with inline buttons
+        return await event.reply("⚠️ No HLS sources available.")
+    # Cache for callbacks
+    STATE[f"{event.chat_id}:{slug}:{ep}"] = {"hls": hls, "referer": referer}
     buttons = [
-        Button.inline(f"{s.get('quality','auto')}", f"Q|{slug}|{ep}|{i}")
-        for i,s in enumerate(hls)
+        Button.inline(s.get("quality", "auto"), f"Q|{slug}|{ep}|{i}")
+        for i, s in enumerate(hls)
     ]
-    await event.reply(
-        "<b>Select quality:</b>",
-        buttons=[buttons[i:i+2] for i in range(0,len(buttons),2)],
-        parse_mode="html"
-    )
+    # send buttons two per row
+    keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+    await event.reply("<b>Select quality:</b>", buttons=keyboard, parse_mode="html")
 
-#─── 2) QUALITY CALLBACK → ASK WHICH SUBTITLES ─────────────────────────────────
 @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"Q|")))
 async def on_quality(event):
     _, slug, ep, idx = event.data.decode().split("|")
+    idx = int(idx)
     key = f"{event.chat_id}:{slug}:{ep}"
     info = STATE.get(key)
     if not info:
-        return await event.answer("Session expired, please resend the link.", alert=True)
-
-    idx = int(idx)
+        return await event.answer("Session expired; please resend the link.", alert=True)
+    hls = info["hls"]
+    referer = info["referer"]
+    stream = hls[idx]["url"]
     info["choice_idx"] = idx
-
-    # fetch tracks for subtitles
-    data = requests.get(
-        f"{API_BASE}/episode/sources",
-        params={"animeEpisodeId":f"{slug}?ep={ep}","server":"hd-1","category":"sub"}
-    ).json()["data"]
-    tracks = [t for t in data.get("tracks",[]) if t["kind"]=="captions"]
+    # fetch tracks for subtitle selection
+    sources, _ = fetch_sources(slug, ep)
+    tracks = [t for t in sources if t.get("kind") == "captions"]
     if not tracks:
-        return await event.edit("⚠️ No subtitles available for this episode.")
-
-    # save tracks and prompt
+        return await event.edit("⚠️ No subtitles available.")
     info["tracks"] = tracks
     buttons = [
         Button.inline(t["label"], f"S|{slug}|{ep}|{i}")
-        for i,t in enumerate(tracks)
+        for i, t in enumerate(tracks)
     ]
-    await event.edit(
-        "<b>Select subtitle:</b>",
-        buttons=[buttons[i:i+2] for i in range(0,len(buttons),2)],
-        parse_mode="html"
-    )
+    keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+    await event.edit("<b>Select subtitle:</b>", buttons=keyboard, parse_mode="html")
 
-#─── 3) SUBTITLE CALLBACK → DOWNLOAD/PROGRESS/UPLOAD ────────────────────────────
 @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"S|")))
 async def on_subtitle(event):
+    # ensure downloads folder exists
+    os.makedirs("downloads", exist_ok=True)
+
     _, slug, ep, tidx = event.data.decode().split("|")
+    tidx = int(tidx)
     key = f"{event.chat_id}:{slug}:{ep}"
     info = STATE.get(key)
     if not info:
-        return await event.answer("Session expired, please resend link.", alert=True)
+        return await event.answer("Session expired; restart by resending link.", alert=True)
 
     hls = info["hls"][info["choice_idx"]]["url"]
     referer = info["referer"]
-    subtitle = info["tracks"][int(tidx)]  # selected track
+    subtitle = info["tracks"][tidx]
 
     status = await event.edit("⏳ Starting download…", parse_mode="html")
 
-    # 3a) remux with ffmpeg & show pseudo-progress
+    # Remux with progress
     out_mp4 = f"downloads/{slug}_{ep}.mp4"
-    cmd = ["ffmpeg","-y","-headers",f"Referer: {referer}\r\n","-i",hls,
-           "-c","copy",out_mp4]
+    cmd = ["ffmpeg", "-y", "-headers", f"Referer: {referer}\r\n", "-i", hls,
+           "-c", "copy", out_mp4]
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
-    total_dur = None
+    total = None
     while True:
         line = proc.stderr.readline()
         if not line and proc.poll() is not None:
             break
-        # try to parse "Duration: 00:23:52.10" to total seconds
         if "Duration:" in line:
-            h,m,s = line.split("Duration:")[1].split(",")[0].strip().split(":")
-            total_dur = int(h)*3600+int(m)*60+float(s)
-        # parse "time=00:01:23.45"
-        if "time=" in line and total_dur:
+            dur = line.split("Duration:")[1].split(",")[0].strip()
+            h, m, s = dur.split(":")
+            total = int(h)*3600 + int(m)*60 + float(s)
+        if "time=" in line and total:
             ts = line.split("time=")[1].split(" ")[0]
-            h,m,s = ts.split(":")
-            cur = int(h)*3600+int(m)*60+float(s)
-            bar = ascii_progress(cur, total_dur)
-            await status.edit(f"⏳ Remuxing… {bar}")
+            h, m, s = ts.split(":")
+            cur = int(h)*3600 + int(m)*60 + float(s)
+            bar = ascii_progress(cur, total)
+            await status.edit(f"⏳ Remuxing… {bar}", parse_mode="html")
 
-    # 3b) download chosen subtitle
-    vtt_url = subtitle["file"]
-    vtt_resp = requests.get(vtt_url)
+    # Download subtitle VTT
+    vtt_resp = requests.get(subtitle["file"])
     vtt_resp.raise_for_status()
     out_vtt = f"downloads/{slug}_{ep}_{subtitle['label']}.vtt"
-    open(out_vtt,"wb").write(vtt_resp.content)
-    await status.edit("💾 Subtitle downloaded, uploading video…")
+    with open(out_vtt, "wb") as f:
+        f.write(vtt_resp.content)
+    await status.edit("💾 Subtitle downloaded, uploading video…", parse_mode="html")
 
-    # 3c) upload video with Telethon progress_callback
-    async def upload_progress(sent, total):
-        bar = ascii_progress(sent, total)
-        await status.edit(f"🚀 Uploading… {bar}")
+    # Upload video with progress callback
+    async def progress_cb(sent, total_bytes):
+        bar = ascii_progress(sent, total_bytes)
+        await status.edit(f"🚀 Uploading… {bar}", parse_mode="html")
 
-    await event.reply(file=out_mp4, progress_callback=upload_progress)
+    await event.reply(file=out_mp4, progress_callback=progress_cb)
     await event.reply(file=out_vtt)
-
     await status.edit("<b>✅ Completed!</b>", parse_mode="html")
+
 
 def main():
     client.start()
-    print("🚀 Userbot started")
+    print("🚀 Hianime userbot running…")
     client.run_until_disconnected()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
