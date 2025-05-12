@@ -1,0 +1,14 @@
+[Unit]
+Description=Hianime Userbot (Telethon)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/hianime-userbot
+ExecStart=/usr/bin/env python3 userbot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
