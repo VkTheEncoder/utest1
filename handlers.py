@@ -1,4 +1,5 @@
 # handlers.py
+
 import logging
 import asyncio
 
@@ -9,13 +10,17 @@ import downloader
 
 
 async def register_handlers(client):
-    # ── /search handler ─────────────────────────────────────────────────────────
+    # ── /search command handler ────────────────────────────────────────────────
     @client.on(events.NewMessage(
         incoming=True,
         outgoing=True,
         pattern=r'^/search(?:@[\w_]+)?\s+(.+)$'
     ))
     async def search_handler(event):
+        """
+        Handles both bot (/search query) and userbot (/search query) messages.
+        Extracts the query, calls fetcher.search_anime, and replies with up to 5 results.
+        """
         query = event.pattern_match.group(1).strip()
         try:
             results = fetcher.search_anime(query)
@@ -26,13 +31,14 @@ async def register_handlers(client):
         if not results:
             return await event.reply("🔍 No results found.")
 
-        text = [f"🔍 Results for “{query}”:"]  # build as list for line breaks
+        # Build and send the reply
+        lines = [f"🔍 Results for “{query}”:"]  
         for anime in results[:5]:
             name = anime.get("name", "Unknown")
             aid  = anime.get("id",   "—")
-            text.append(f"• {name}  (ID: {aid})")
+            lines.append(f"• {name}  (ID: {aid})")
 
-        await event.reply("\n".join(text))
+        await event.reply("\n".join(lines))
 
 
     # ── Single‐episode callback ─────────────────────────────────────────────────
@@ -81,7 +87,7 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
     )
 
     try:
-        url    = fetcher.get_url(episode_id)
+        url     = fetcher.get_url(episode_id)
         out_mp4 = downloader.remux(url, episode_id)
         await client.send_file(
             chat_id,
@@ -92,7 +98,6 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
     finally:
         # always remove the “downloading” notice
         await status.delete()
-
 
 
 async def _process_queue(client, chat_id: int):
