@@ -68,7 +68,6 @@ async def on_episode_link(event):
         Button.inline(s.get("quality", "auto"), f"Q|{slug}|{ep}|{i}")
         for i, s in enumerate(hls)
     ]
-    # send buttons two per row
     keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
     await event.reply("<b>Select quality:</b>", buttons=keyboard, parse_mode="html")
 
@@ -80,15 +79,23 @@ async def on_quality(event):
     info = STATE.get(key)
     if not info:
         return await event.answer("Session expired; please resend the link.", alert=True)
-    hls = info["hls"]
+    hls_list = info["hls"]
     referer = info["referer"]
-    stream = hls[idx]["url"]
+    stream = hls_list[idx]["url"]
     info["choice_idx"] = idx
-    # fetch tracks for subtitle selection
-    sources, _ = fetch_sources(slug, ep)
-    tracks = [t for t in sources if t.get("kind") == "captions"]
+
+    # Fetch full API data to get tracks
+    resp = requests.get(
+        f"{API_BASE}/episode/sources",
+        params={"animeEpisodeId": f"{slug}?ep={ep}", "server": "hd-1", "category": "sub"}
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+
+    tracks = data.get("tracks", [])
     if not tracks:
         return await event.edit("⚠️ No subtitles available.")
+
     info["tracks"] = tracks
     buttons = [
         Button.inline(t["label"], f"S|{slug}|{ep}|{i}")
@@ -109,7 +116,7 @@ async def on_subtitle(event):
     if not info:
         return await event.answer("Session expired; restart by resending link.", alert=True)
 
-    hls = info["hls"][info["choice_idx"]]["url"]
+    hls_url = info["hls"][info["choice_idx"]]["url"]
     referer = info["referer"]
     subtitle = info["tracks"][tidx]
 
@@ -117,7 +124,7 @@ async def on_subtitle(event):
 
     # Remux with progress
     out_mp4 = f"downloads/{slug}_{ep}.mp4"
-    cmd = ["ffmpeg", "-y", "-headers", f"Referer: {referer}\r\n", "-i", hls,
+    cmd = ["ffmpeg", "-y", "-headers", f"Referer: {referer}\r\n", "-i", hls_url,
            "-c", "copy", out_mp4]
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
     total = None
@@ -128,11 +135,11 @@ async def on_subtitle(event):
         if "Duration:" in line:
             dur = line.split("Duration:")[1].split(",")[0].strip()
             h, m, s = dur.split(":")
-            total = int(h)*3600 + int(m)*60 + float(s)
+            total = int(h) * 3600 + int(m) * 60 + float(s)
         if "time=" in line and total:
             ts = line.split("time=")[1].split(" ")[0]
             h, m, s = ts.split(":")
-            cur = int(h)*3600 + int(m)*60 + float(s)
+            cur = int(h) * 3600 + int(m) * 60 + float(s)
             bar = ascii_progress(cur, total)
             await status.edit(f"⏳ Remuxing… {bar}", parse_mode="html")
 
@@ -152,7 +159,6 @@ async def on_subtitle(event):
     await event.reply(file=out_mp4, progress_callback=progress_cb)
     await event.reply(file=out_vtt)
     await status.edit("<b>✅ Completed!</b>", parse_mode="html")
-
 
 def main():
     client.start()
