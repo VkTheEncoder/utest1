@@ -32,7 +32,6 @@ async def register_handlers(client):
             return await event.reply("🔍 No results found.")
 
         state = STATE.setdefault(chat_id, {})
-        # store id→title
         for a in results[:5]:
             state.setdefault("anime_meta", {})[a["id"]] = a["name"]
 
@@ -63,7 +62,6 @@ async def register_handlers(client):
         if not eps:
             return await event.edit("⚠️ No episodes found.")
 
-        # queue & map
         state["queue"] = [e["episodeId"] for e in eps]
         state["episodes_map"] = {e["episodeId"]: e["number"] for e in eps}
 
@@ -107,7 +105,6 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
     ep_num     = state.get("episodes_map", {}).get(episode_id, "")
     safe_anime = "".join(c for c in anime_name if c.isalnum() or c in " _-").strip()
 
-    # choose edit vs send_message
     if ctx_event:
         edit_fn = ctx_event.edit
     else:
@@ -120,7 +117,7 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
         out_dir = os.path.join(DOWNLOAD_DIR, safe_anime)
         os.makedirs(out_dir, exist_ok=True)
 
-        # 1) remux video
+        # 1) remux video to MP4 with renamed filename
         sources, referer = fetcher.fetch_sources_and_referer(episode_id)
         m3u8 = sources[0].get("url") or sources[0].get("file")
         mp4_name = f"{safe_anime} ep-{ep_num}.mp4"
@@ -132,39 +129,25 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
             m3u8, referer, out_mp4
         )
 
-        # 2) fetch subtitle tracks
+        # 2) download subtitle (keep original filename)
         tracks = fetcher.fetch_tracks(episode_id)
         sub_path = None
-
-        # helper to rename a raw file to our naming scheme
-        def _rename(raw_path, code):
-            ext = os.path.splitext(raw_path)[1] or ".vtt"
-            new_name = f"ep-{ep_num} {code}{ext}"
-            dst = os.path.join(out_dir, new_name)
-            os.replace(raw_path, dst)
-            return dst
-
-        # first try common English codes
+        # look for English codes first
         for code in ("en","eng","english"):
             for tr in tracks:
                 lang = tr.get("lang", tr.get("code","")).lower()
                 if lang.startswith(code):
                     try:
-                        raw = downloader.download_subtitle(tr, out_dir, episode_id)
-                        sub_path = _rename(raw, code)
+                        sub_path = downloader.download_subtitle(tr, out_dir, episode_id)
                     except Exception:
                         logging.exception("Subtitle download failed for %s", code)
                     break
             if sub_path:
                 break
-
-        # fallback: first track if none matched
+        # fallback to first track if none matched
         if not sub_path and tracks:
             try:
-                tr = tracks[0]
-                raw = downloader.download_subtitle(tr, out_dir, episode_id)
-                code = tr.get("lang","sub").lower()
-                sub_path = _rename(raw, code)
+                sub_path = downloader.download_subtitle(tracks[0], out_dir, episode_id)
             except Exception:
                 logging.exception("Fallback subtitle failed")
 
@@ -176,7 +159,7 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
             parse_mode="markdown"
         )
 
-        # 4) send subtitle if we have one
+        # 4) send subtitle if present, with original name
         if sub_path and os.path.exists(sub_path):
             await client.send_file(
                 chat_id,
