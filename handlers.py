@@ -9,10 +9,12 @@ from config import STATE
 import fetcher
 import downloader
 
+# Where all downloads go
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
 
 
 async def register_handlers(client):
+    # ── /search command: list matching anime ────────────────────────────────────
     @client.on(events.NewMessage(
         incoming=True,
         outgoing=True,
@@ -32,8 +34,10 @@ async def register_handlers(client):
             return await event.reply("🔍 No results found.")
 
         state = STATE.setdefault(chat_id, {})
+        # store id→title for later
+        state.setdefault("anime_meta", {})
         for a in results[:5]:
-            state.setdefault("anime_meta", {})[a["id"]] = a["name"]
+            state["anime_meta"][a["id"]] = a["name"]
 
         buttons = [
             [Button.inline(a["name"], data=f"ANIME|{a['id']}".encode())]
@@ -42,26 +46,30 @@ async def register_handlers(client):
         await event.reply("🔍 Select an anime:", buttons=buttons)
 
 
+    # ── Anime selected: fetch its episodes ────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ANIME|")))
     async def on_select_anime(event):
         await event.answer()
-        anime_id = event.data.decode().split("|",1)[1]
+        anime_id = event.data.decode().split("|", 1)[1]
         chat_id  = event.chat_id
         state    = STATE.setdefault(chat_id, {})
 
-        anime_name = state["anime_meta"].get(anime_id, anime_id)
+        anime_name = state.get("anime_meta", {}).get(anime_id, anime_id)
         state["current_anime_name"] = anime_name
 
         try:
             eps = fetcher.fetch_episodes(anime_id)
         except Exception:
             logging.exception("Failed to fetch episodes")
-            return await event.edit(f"❌ Could not load episodes for **{anime_name}**",
-                                    parse_mode="markdown")
+            return await event.edit(
+                f"❌ Could not load episodes for **{anime_name}**",
+                parse_mode="markdown"
+            )
 
         if not eps:
             return await event.edit("⚠️ No episodes found.")
 
+        # queue and map episodeId→number
         state["queue"] = [e["episodeId"] for e in eps]
         state["episodes_map"] = {e["episodeId"]: e["number"] for e in eps}
 
@@ -79,13 +87,20 @@ async def register_handlers(client):
         )
 
 
+    # ── Single‐episode callback ─────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"EP|")))
     async def on_single_episode(event):
         await event.answer()
-        episode_id = event.data.decode().split("|",1)[1]
-        await _download_episode(event.client, event.chat_id, episode_id, ctx_event=event)
+        episode_id = event.data.decode().split("|", 1)[1]
+        await _download_episode(
+            event.client,
+            event.chat_id,
+            episode_id,
+            ctx_event=event
+        )
 
 
+    # ── “Download All” callback ────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ALL|")))
     async def on_all(event):
         await event.answer()
@@ -100,28 +115,36 @@ async def register_handlers(client):
 
 
 async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=None):
+    """
+    Downloads one episode (video + subtitle), renames the MP4 to
+    "<Anime Title> ep-<No>.mp4", and sends both files.
+    Subtitle selection prioritizes: eng-2.vtt, en.vtt, eng.vtt, english.vtt
+    """
     state      = STATE.get(chat_id, {})
     anime_name = state.get("current_anime_name", episode_id)
     ep_num     = state.get("episodes_map", {}).get(episode_id, "")
     safe_anime = "".join(c for c in anime_name if c.isalnum() or c in " _-").strip()
 
+    # choose edit vs new message
     if ctx_event:
         edit_fn = ctx_event.edit
     else:
         edit_fn = lambda txt, **k: client.send_message(chat_id, txt, **k)
 
-    status = await edit_fn(f"⏳ Downloading **{anime_name}** ep-{ep_num}…",
-                           parse_mode="markdown")
+    status = await edit_fn(
+        f"⏳ Downloading **{anime_name}** ep-{ep_num}…",
+        parse_mode="markdown"
+    )
 
     try:
         out_dir = os.path.join(DOWNLOAD_DIR, safe_anime)
         os.makedirs(out_dir, exist_ok=True)
 
-        # 1) remux video to MP4 with renamed filename
+        # 1) Fetch & remux HLS → MP4
         sources, referer = fetcher.fetch_sources_and_referer(episode_id)
-        m3u8 = sources[0].get("url") or sources[0].get("file")
+        m3u8     = sources[0].get("url") or sources[0].get("file")
         mp4_name = f"{safe_anime} ep-{ep_num}.mp4"
-        out_mp4   = os.path.join(out_dir, mp4_name)
+        out_mp4  = os.path.join(out_dir, mp4_name)
 
         await asyncio.get_event_loop().run_in_executor(
             None,
@@ -129,29 +152,30 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
             m3u8, referer, out_mp4
         )
 
-        # 2) download subtitle (keep original filename)
-        tracks = fetcher.fetch_tracks(episode_id)
+        # 2) Pick subtitle by filename priority
+        tracks   = fetcher.fetch_tracks(episode_id)
         sub_path = None
-        # look for English codes first
-        for code in ("en","eng","english"):
-            for tr in tracks:
-                lang = tr.get("lang", tr.get("code","")).lower()
-                if lang.startswith(code):
-                    try:
-                        sub_path = downloader.download_subtitle(tr, out_dir, episode_id)
-                    except Exception:
-                        logging.exception("Subtitle download failed for %s", code)
-                    break
-            if sub_path:
-                break
-        # fallback to first track if none matched
-        if not sub_path and tracks:
-            try:
-                sub_path = downloader.download_subtitle(tracks[0], out_dir, episode_id)
-            except Exception:
-                logging.exception("Fallback subtitle failed")
 
-        # 3) send video
+        priority = ["eng-2.vtt", "en.vtt", "eng.vtt", "english.vtt"]
+        selected = None
+
+        for want in priority:
+            for tr in tracks:
+                url   = tr.get("file") or tr.get("url") or ""
+                fname = url.split("/")[-1].lower()
+                if fname == want:
+                    selected = tr
+                    break
+            if selected:
+                break
+
+        if selected:
+            try:
+                sub_path = downloader.download_subtitle(selected, out_dir, episode_id)
+            except Exception:
+                logging.exception("Subtitle download failed for %s", want)
+
+        # 3) Send video
         await client.send_file(
             chat_id,
             out_mp4,
@@ -159,7 +183,7 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
             parse_mode="markdown"
         )
 
-        # 4) send subtitle if present, with original name
+        # 4) Send subtitle only if it matches our priority list
         if sub_path and os.path.exists(sub_path):
             await client.send_file(
                 chat_id,
@@ -180,6 +204,9 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
 
 
 async def _process_queue(client, chat_id: int):
+    """
+    Drain the STATE queue for this chat, one episode at a time.
+    """
     queue = STATE.get(chat_id, {}).get("queue", [])
     while queue:
         ep = queue.pop(0)
