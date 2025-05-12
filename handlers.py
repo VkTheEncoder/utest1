@@ -1,3 +1,4 @@
+# handlers.py
 import logging
 import asyncio
 
@@ -8,24 +9,59 @@ import downloader
 
 
 async def register_handlers(client):
+    # ── /search handler ─────────────────────────────────────────────────────────
+    @client.on(events.NewMessage(
+        incoming=True,
+        outgoing=True,
+        pattern=r'^/search(?:@[\w_]+)?\s+(.+)$'
+    ))
+    async def search_handler(event):
+        query = event.pattern_match.group(1).strip()
+        try:
+            results = fetcher.search_anime(query)
+        except Exception as e:
+            logging.exception("Search request failed")
+            return await event.reply(f"❌ Search error: {e}")
+
+        if not results:
+            return await event.reply("🔍 No results found.")
+
+        text = [f"🔍 Results for “{query}”:"]  # build as list for line breaks
+        for anime in results[:5]:
+            name = anime.get("name", "Unknown")
+            aid  = anime.get("id",   "—")
+            text.append(f"• {name}  (ID: {aid})")
+
+        await event.reply("\n".join(text))
+
+
+    # ── Single‐episode callback ─────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"EP|")))
     async def on_single_episode(event):
         episode_id = event.data.decode().split("|", 1)[1]
         await event.answer()
-        # pass the Telethon client instance explicitly
-        await _download_episode(event.client, event.chat_id, episode_id, ctx_event=event)
+        await _download_episode(
+            event.client,
+            event.chat_id,
+            episode_id,
+            ctx_event=event
+        )
 
+
+    # ── “Download All” callback ────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ALL|")))
     async def on_all(event):
         await event.answer()
         chat_id = event.chat_id
 
-        # populate the queue however you do in fetcher
+        # populate the queue however you fetch your IDs:
         episodes = fetcher.get_all_episode_ids()
         STATE.setdefault(chat_id, {})["queue"] = episodes.copy()
 
         await event.respond("✅ Queued all episodes. Starting downloads…")
+        # Process in background
         asyncio.create_task(_process_queue(event.client, chat_id))
+
 
 
 async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=None):
@@ -33,33 +69,35 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
     Downloads/remuxes a single episode and sends it.
     Uses ctx_event.edit(...) if provided, else sends a new message.
     """
-    # choose edit vs. send_message
+    # choose whether we edit or send a fresh message
     if ctx_event:
-        edit = ctx_event.edit
+        edit_fn = ctx_event.edit
     else:
-        edit = lambda text, **kw: client.send_message(chat_id, text, **kw)
+        edit_fn = lambda text, **k: client.send_message(chat_id, text, **k)
 
-    status = await edit(f"⏳ Downloading <b>{episode_id}</b>…", parse_mode="html")
-
-    # fetch & remux
-    url = fetcher.get_url(episode_id)
-    out_mp4 = downloader.remux(url, episode_id)
-
-    # send the file
-    await client.send_file(
-        chat_id,
-        out_mp4,
-        caption=f"<b>{episode_id}</b>",
+    status = await edit_fn(
+        f"⏳ Downloading <b>{episode_id}</b>…",
         parse_mode="html"
     )
 
-    # delete the “downloading” notice
-    await status.delete()
+    try:
+        url    = fetcher.get_url(episode_id)
+        out_mp4 = downloader.remux(url, episode_id)
+        await client.send_file(
+            chat_id,
+            out_mp4,
+            caption=f"<b>{episode_id}</b>",
+            parse_mode="html"
+        )
+    finally:
+        # always remove the “downloading” notice
+        await status.delete()
+
 
 
 async def _process_queue(client, chat_id: int):
     """
-    Processes the queued episode IDs one by one.
+    Processes all queued episodes, one by one.
     """
     state = STATE.get(chat_id, {})
     queue = state.get("queue", [])
