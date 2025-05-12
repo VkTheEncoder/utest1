@@ -1,13 +1,19 @@
+# handlers.py
 import os
 import time
 import logging
 from urllib.parse import urlparse, parse_qs
+
 from telethon import events, Button
+
 from fetcher import fetch_sources_and_referer, fetch_tracks
 from downloader import remux_with_progress, download_subtitle
 
-# In-memory state per chat
-STATE = {}
+# In‐memory per‐chat state
+STATE: dict[int, dict] = {}
+
+# Regex to match episode URLs
+URL_EP = r'https?://hianimez?\.to/watch/[^?\s]+[?&]ep=\d+'
 
 def build_progress_card(
     title: str,
@@ -16,10 +22,13 @@ def build_progress_card(
     start: float,
     now: float
 ) -> str:
+    """
+    Returns an HTML‐formatted progress card.
+    """
     elapsed = now - start
-    pct = transferred / total * 100 if total else 0
-    speed = transferred / elapsed if elapsed>0 else 0
-    eta = (total - transferred) / speed if speed>0 else 0
+    pct     = transferred / total * 100 if total else 0
+    speed   = transferred / elapsed     if elapsed > 0 else 0
+    eta     = (total - transferred) / speed if speed > 0 else 0
 
     return (
         f"<b>{title}</b>\n\n"
@@ -30,81 +39,94 @@ def build_progress_card(
         f"📊 Progress: {pct:.1f}%"
     )
 
-URL_EP = r'https?://hianimez?\.to/watch/[^?\s]+[?&]ep=\d+'
+async def register_handlers(client):
+    @client.on(events.NewMessage(pattern=URL_EP))
+    async def on_episode_link(event):
+        url = event.text.strip()
+        p   = urlparse(url)
+        slug = p.path.strip("/").split("/")[-1]
+        ep   = parse_qs(p.query).get("ep", [None])[0]
+        if not ep:
+            return await event.reply("❌ Missing `ep=` in URL.")
 
-@client.on(events.NewMessage(pattern=URL_EP))
-async def on_episode_link(event):
-    url = event.text.strip()
-    p = urlparse(url)
-    slug = p.path.strip("/").split("/")[-1]
-    ep   = parse_qs(p.query).get("ep", [None])[0]
-    if not ep:
-        return await event.reply("❌ Missing `ep=` in URL.")
+        # 1) fetch HLS sources + referer
+        sources, referer = fetch_sources_and_referer(slug, ep)
+        hls_list = [s for s in sources if s.get("type") == "hls"]
+        if not hls_list:
+            return await event.reply("⚠️ No HLS streams found.")
 
-    sources, referer = fetch_sources_and_referer(slug, ep)
-    hls = [s for s in sources if s.get("type")=="hls"]
-    if not hls:
-        return await event.reply("⚠️ No HLS streams found.")
+        # cache for callback
+        STATE[event.chat_id] = {
+            "slug": slug,
+            "ep": ep,
+            "hls_list": hls_list,
+            "referer": referer
+        }
 
-    # Cache for callback
-    STATE[event.chat_id] = {
-        "slug": slug,
-        "ep": ep,
-        "hls": hls,
-        "referer": referer
-    }
+        # build quality buttons
+        buttons = [
+            Button.inline(s.get("quality", "auto"), f"Q|{i}")
+            for i, s in enumerate(hls_list)
+        ]
+        keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+        await event.reply(
+            "<b>Select quality:</b>",
+            buttons=keyboard,
+            parse_mode="html"
+        )
 
-    # Pick best quality by numeric trailing
-    buttons = [
-        Button.inline(s.get("quality","auto"), f"Q|{i}")
-        for i,s in enumerate(hls)
-    ]
-    kb = [buttons[i:i+2] for i in range(0,len(buttons),2)]
-    await event.reply("<b>Select quality:</b>", buttons=kb, parse_mode="html")
+    @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"Q|")))
+    async def on_quality(event):
+        # which quality did they pick?
+        _, idx_s = event.data.decode().split("|")
+        idx = int(idx_s)
+        st  = STATE.get(event.chat_id)
+        if not st:
+            return await event.answer("Session expired – resend link.", alert=True)
 
-@client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"Q|")))
-async def on_quality(event):
-    idx = int(event.data.decode().split("|")[1])
-    st  = STATE.get(event.chat_id)
-    if not st:
-        return await event.answer("Session expired.", alert=True)
+        slug, ep, referer = st["slug"], st["ep"], st["referer"]
+        m3u8_url         = st["hls_list"][idx]["url"]
 
-    slug, ep, referer = st["slug"], st["ep"], st["referer"]
-    m3u8 = st["hls"][idx]["url"]
+        # pick English subtitle if available
+        tracks = fetch_tracks(slug, ep)
+        eng = next((t for t in tracks
+                    if "english" in t.get("label","").lower()), None)
 
-    # pick English subtitle if any
-    tracks = fetch_tracks(slug, ep)
-    eng = next((t for t in tracks if "english" in t.get("label","").lower()), None)
+        # 2) start status message
+        status = await event.edit("⏳ Preparing download…", parse_mode="html")
 
-    status = await event.edit("⏳ Preparing download…", parse_mode="html")
+        # 3) download+remux with live progress
+        out_mp4 = f"downloads/{slug}_{ep}.mp4"
+        start   = time.time()
 
-    out_mp4 = f"downloads/{slug}_{ep}.mp4"
-    # DOWNLOAD & REMUX with live card updates
-    def dl_cb(transferred, total, start):
-        now = time.time()
-        text = build_progress_card("📥 Downloading File", transferred, total, start, now)
-        # we must schedule the edit onto the event loop
-        return event.edit(text, parse_mode="html")
+        def dl_cb(transferred, total, t0):
+            now = time.time()
+            card = build_progress_card("📥 Downloading File",
+                                       transferred, total, t0, now)
+            # schedule the edit
+            return event.edit(card, parse_mode="html")
 
-    remux_with_progress(m3u8, referer, out_mp4, dl_cb)
+        remux_with_progress(m3u8_url, referer, out_mp4, dl_cb)
 
-    # SUBTITLE
-    if eng:
-        await status.edit("💾 Downloading subtitle…", parse_mode="html")
-        sub_path = download_subtitle(eng, "downloads", f"{slug}_{ep}")
-    else:
-        sub_path = None
+        # 4) download subtitle
+        if eng:
+            await status.edit("💾 Downloading subtitle…", parse_mode="html")
+            sub_path = download_subtitle(eng, "downloads", f"{slug}_{ep}")
+        else:
+            sub_path = None
 
-    # UPLOAD with progress card
-    start = time.time()
+        # 5) upload with live progress
+        await status.edit("🚀 Uploading video…", parse_mode="html")
+        up_start = time.time()
 
-    async def up_cb(sent, total):
-        now = time.time()
-        text = build_progress_card("📤 Uploading File", sent, total, start, now)
-        await event.edit(text, parse_mode="html")
+        async def up_cb(sent, total):
+            now = time.time()
+            card = build_progress_card("📤 Uploading File",
+                                       sent, total, up_start, now)
+            await event.edit(card, parse_mode="html")
 
-    await event.edit("🚀 Uploading file…", parse_mode="html")
-    await event.reply(file=out_mp4, progress_callback=up_cb)
-    if sub_path:
-        await event.reply(file=sub_path)
-    await event.edit("<b>✅ Completed!</b>", parse_mode="html")
+        await event.reply(file=out_mp4, progress_callback=up_cb)
+        if sub_path:
+            await event.reply(file=sub_path)
+
+        await event.edit("<b>✅ Completed!</b>", parse_mode="html")
