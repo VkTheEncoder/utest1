@@ -9,9 +9,12 @@ from config import STATE
 import fetcher
 import downloader
 
+# Base folder where we'll store per-episode downloads
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
+
 
 async def register_handlers(client):
-    # ── /search command: shows inline buttons for anime results ───────────────
+    # ── /search command: list matching anime ────────────────────────────────────
     @client.on(events.NewMessage(
         incoming=True,
         outgoing=True,
@@ -28,105 +31,114 @@ async def register_handlers(client):
         if not results:
             return await event.reply("🔍 No results found.")
 
-        # Build an inline keyboard: one button per anime
         buttons = [
-            [Button.inline(anime["name"], data=f"ANIME|{anime['id']}".encode())]
-            for anime in results[:5]
+            [Button.inline(a["name"], data=f"ANIME|{a['id']}".encode())]
+            for a in results[:5]
         ]
-        await event.reply(
-            "🔍 Select an anime:",
-            buttons=buttons
-        )
+        await event.reply("🔍 Select an anime:", buttons=buttons)
 
 
-    # ── Anime selected: list its episodes ─────────────────────────────────────
+    # ── Anime selected: fetch its episodes ────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ANIME|")))
     async def on_select_anime(event):
         await event.answer()
         anime_id = event.data.decode().split("|", 1)[1]
+        chat_id  = event.chat_id
 
-        # Fetch episode list for this anime
+        # fetch_episodes returns list of { number, title, episodeId, … }
         try:
-            episodes = fetcher.get_episode_list(anime_id)  # → [{ "id": "...", "title": "Episode 1" }, …]
+            eps = fetcher.fetch_episodes(anime_id)
         except Exception as e:
             logging.exception("Failed to fetch episodes")
             return await event.edit(f"❌ Could not load episodes for `{anime_id}`")
 
-        # Store episodes in STATE so "Download All" can access them
-        chat_id = event.chat_id
-        STATE.setdefault(chat_id, {})["queue"] = [ep["id"] for ep in episodes]
+        if not eps:
+            return await event.edit("⚠️ No episodes found.")
 
-        # Build buttons: one per episode, plus a "Download All" button
+        # store queue for “Download All”
+        STATE.setdefault(chat_id, {})["queue"] = [e["episodeId"] for e in eps]
+
+        # button per episode
         buttons = [
-            [Button.inline(ep["title"], data=f"EP|{ep['id']}".encode())]
-            for ep in episodes
+            [Button.inline(f"{e['number']}. {e.get('title','')}", data=f"EP|{e['episodeId']}".encode())]
+            for e in eps
         ]
-        buttons.append([Button.inline("Download All ▶️", data=f"ALL|{anime_id}".encode())])
+        # plus a “download all” button
+        buttons.append([Button.inline("▶️ Download All", data=f"ALL|{anime_id}".encode())])
 
         await event.edit(
-            f"📺 `{len(episodes)}` episodes found. Pick one or download all:",
-            buttons=buttons,
-            parse_mode="markdown"
+            f"📺 Found {len(eps)} episodes. Pick one or Download All:",
+            buttons=buttons
         )
 
 
-    # ── Single‐episode callback ─────────────────────────────────────────────────
+    # ── Single-episode download ───────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"EP|")))
     async def on_single_episode(event):
         await event.answer()
-        episode_id = event.data.decode().split("|", 1)[1]
-        await _download_episode(
-            event.client,
-            event.chat_id,
-            episode_id,
-            ctx_event=event
-        )
+        episode_id = event.data.decode().split("|",1)[1]
+        await _download_episode(event.client, event.chat_id, episode_id, ctx_event=event)
 
 
-    # ── “Download All” callback ────────────────────────────────────────────────
+    # ── “Download All” handler ────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ALL|")))
     async def on_all(event):
         await event.answer()
         chat_id = event.chat_id
-
-        # The queue was populated in on_select_anime
         queue = STATE.get(chat_id, {}).get("queue", [])
         if not queue:
-            return await event.edit("❌ Nothing in queue to download.")
+            return await event.edit("⚠️ Nothing queued.")
 
-        await event.edit("✅ Queued all episodes. Starting downloads…")
+        await event.edit("✅ Queued all episodes. Starting…")
         asyncio.create_task(_process_queue(event.client, chat_id))
+
 
 
 async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=None):
     """
-    Downloads one episode (video + subtitle) and sends it.
-    Edits ctx_event if provided, else sends a fresh message.
+    Downloads a single episode (video + subtitle) and sends it.
     """
-    # Choose edit vs. new message
+    # choose edit vs send_message
     if ctx_event:
         edit_fn = ctx_event.edit
     else:
-        edit_fn = lambda text, **k: client.send_message(chat_id, text, **k)
+        edit_fn = lambda txt, **k: client.send_message(chat_id, txt, **k)
 
     status = await edit_fn(f"⏳ Downloading `{episode_id}`…", parse_mode="markdown")
 
     try:
-        # 1) Download & remux video
-        url     = fetcher.get_url(episode_id)
-        out_mp4 = downloader.remux(url, episode_id)
+        # prepare folder
+        out_dir = os.path.join(DOWNLOAD_DIR, episode_id)
+        os.makedirs(out_dir, exist_ok=True)
 
-        # 2) Attempt subtitle download, checking common codes
+        # 1) get HLS source + referer
+        sources, referer = fetcher.fetch_sources_and_referer(episode_id)
+        if not sources:
+            raise RuntimeError("No video sources available")
+        m3u8_url = sources[0].get("url") or sources[0].get("file")
+        if not m3u8_url:
+            raise RuntimeError("Malformed source record")
+
+        # 2) remux to MP4 (blocks thread, so run in executor)
+        out_mp4 = os.path.join(out_dir, f"{episode_id}.mp4")
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            downloader.remux_hls,
+            m3u8_url,
+            referer,
+            out_mp4
+        )
+
+        # 3) fetch subtitles
+        tracks = fetcher.fetch_tracks(episode_id)
         sub_path = None
-        for lang in ("en", "eng", "english"):
-            try:
-                sub_url = fetcher.get_subtitle_url(episode_id, lang)
-                sub_path = downloader.download_subtitle(sub_url, episode_id, lang)
+        for tr in tracks:
+            label = tr.get("label", tr.get("lang", "")).split()[0].lower()
+            if label in ("en", "eng", "english"):
+                sub_path = downloader.download_subtitle(tr, out_dir, episode_id)
                 break
-            except Exception:
-                continue
 
-        # 3) Send video file
+        # 4) send video
         await client.send_file(
             chat_id,
             out_mp4,
@@ -134,7 +146,7 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
             parse_mode="markdown"
         )
 
-        # 4) If subtitle found, send it too
+        # 5) send subtitle if found
         if sub_path and os.path.exists(sub_path):
             await client.send_file(
                 chat_id,
@@ -143,29 +155,27 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
                 file_name=os.path.basename(sub_path)
             )
         else:
-            # quietly log; no more “not found” errors to user
             logging.info("No subtitle found for %s", episode_id)
 
+    except Exception as e:
+        logging.exception("Download error")
+        await client.send_message(chat_id, f"❌ Error with `{episode_id}`: {e}")
+
     finally:
-        # remove the “downloading” notice
         await status.delete()
 
 
 async def _process_queue(client, chat_id: int):
     """
-    Processes all queued episode IDs in STATE[chat_id]['queue'] one by one.
+    Drain the STATE queue for this chat, one epi at a time.
     """
     queue = STATE.get(chat_id, {}).get("queue", [])
-
     while queue:
-        episode_id = queue.pop(0)
+        ep = queue.pop(0)
         try:
-            await _download_episode(client, chat_id, episode_id)
+            await _download_episode(client, chat_id, ep)
         except Exception:
-            logging.exception("Failed during queued download")
-            await client.send_message(
-                chat_id,
-                f"❌ Error downloading `{episode_id}`"
-            )
+            logging.exception("Queued download failed")
+            await client.send_message(chat_id, f"❌ Failed on `{ep}`")
 
-    await client.send_message(chat_id, "✅ All done!")
+    await client.send_message(chat_id, "✅ All downloads complete!")
