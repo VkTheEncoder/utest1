@@ -2,7 +2,6 @@ services:
   api:
     build:
       context: ./hianime-api
-      dockerfile: Dockerfile
     ports:
       - "4000:4000"
     restart: unless-stopped
@@ -12,16 +11,9 @@ services:
       timeout: 5s
       retries: 3
 
-  bot:
-    build:
-      context: .             # ← point at repo root
-      dockerfile: Dockerfile # ← if your bot Dockerfile is at /root/utest1/Dockerfile
-    depends_on:
-      api:
-        condition: service_healthy
+    # <<< ADD THIS BLOCK >>>
     environment:
-      - ANIWATCH_API_BASE=http://api:4000/api/v2/hianime
       - API_ID=${API_ID}
       - API_HASH=${API_HASH}
-      - BOT_TOKEN=${BOT_TOKEN}
-    restart: on-failure
+      - BOT_TOKEN=${BOT_TOKEN}     # if present, else remove
+      - ANIWATCH_API_BASE=${ANIWATCH_API_BASE}
