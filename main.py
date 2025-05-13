@@ -1,7 +1,7 @@
 # main.py
 import logging
 from telethon import TelegramClient
-from config import API_ID, API_HASH
+from config import ANIWATCH_API_BASE as API_BASE
 from handlers import register_handlers
 
 logging.basicConfig(level=logging.INFO)
