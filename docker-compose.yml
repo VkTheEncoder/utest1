@@ -1,10 +1,10 @@
-# docker-compose.yml (at /root/)
 version: '3.8'
 
 services:
   api:
     build:
       context: ./hianime-api
+      dockerfile: Dockerfile
     ports:
       - "4000:4000"
     restart: unless-stopped
@@ -16,7 +16,8 @@ services:
 
   bot:
     build:
-      context: ./utest1
+      context: .                   # ← point here at your repo root
+      dockerfile: Dockerfile       # ← if your bot Dockerfile is named Dockerfile at root
     depends_on:
       api:
         condition: service_healthy
