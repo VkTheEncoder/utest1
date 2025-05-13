@@ -4,6 +4,7 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from config import ANIWATCH_API_BASE as API_BASE
 
 # Import your existing modules here:
 # from . import fetcher, episodes, sources, tracks
