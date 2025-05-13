@@ -1,0 +1,28 @@
+# docker-compose.yml (at /root/)
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: ./hianime-api
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  bot:
+    build:
+      context: ./utest1
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      - ANIWATCH_API_BASE=http://api:4000/api/v2/hianime
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - BOT_TOKEN=${BOT_TOKEN}
+    restart: on-failure
