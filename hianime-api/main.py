@@ -5,15 +5,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# import your existing fetcher / episodes / sources / tracks logic here
-import fetcher
+# Import your existing modules here:
+# from . import fetcher, episodes, sources, tracks
+import fetcher      # adjust the import paths if needed
 import episodes
 import sources
 import tracks
 
-app = FastAPI(title="Hianimez API")
+app = FastAPI(title="Hianimez Local API")
 
-# Allow CORS from anywhere (or lock it down as you prefer)
+# Allow CORS from anywhere (for simplicity)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,13 +22,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1) Health-check route
+# 1) Health endpoint
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# 2) Search endpoint
+# 2) Search
 @app.get("/api/v2/hianime/search")
 async def search(q: str, page: int = 1):
     try:
@@ -36,18 +37,18 @@ async def search(q: str, page: int = 1):
         raise HTTPException(502, str(e))
 
 
-# 3) Episodes endpoint
+# 3) Episodes
 @app.get("/api/v2/hianime/episodes/{anime_id}")
-async def get_eps(anime_id: str):
+async def get_episodes(anime_id: str):
     try:
         return episodes.fetch_episodes(anime_id)
     except Exception as e:
         raise HTTPException(502, str(e))
 
 
-# 4) Sources endpoint
+# 4) Sources
 @app.get("/api/v2/hianime/sources/{episode_id}")
-async def get_src(episode_id: str):
+async def get_sources(episode_id: str):
     try:
         sources_list, _ = sources.fetch_sources_and_referer(episode_id)
         return sources_list
@@ -55,7 +56,7 @@ async def get_src(episode_id: str):
         raise HTTPException(502, str(e))
 
 
-# 5) Tracks endpoint
+# 5) Tracks
 @app.get("/api/v2/hianime/tracks/{episode_id}")
 async def get_tracks(episode_id: str):
     try:
