@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   api:
     build:
@@ -16,8 +14,8 @@ services:
 
   bot:
     build:
-      context: .                   # ← point here at your repo root
-      dockerfile: Dockerfile       # ← if your bot Dockerfile is named Dockerfile at root
+      context: .             # ← point at repo root
+      dockerfile: Dockerfile # ← if your bot Dockerfile is at /root/utest1/Dockerfile
     depends_on:
       api:
         condition: service_healthy
